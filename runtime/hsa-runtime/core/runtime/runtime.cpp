@@ -2050,7 +2050,8 @@ void Runtime::Unload() {
   core::InterruptSignal::DestroyEvent(hw_exception_event_);
   hw_exception_event_ = nullptr;
 
-  SharedSignalPool.clear();
+  for (int i=0; i<16; i++)
+    SharedSignalPool[i].clear();
 
   EventPool.clear();
 

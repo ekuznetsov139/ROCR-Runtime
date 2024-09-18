@@ -454,7 +454,7 @@ class Runtime {
 
   void InternalQueueCreateNotify(const hsa_queue_t* queue, hsa_agent_t agent);
 
-  SharedSignalPool_t* GetSharedSignalPool() { return &SharedSignalPool; }
+  SharedSignalPool_t* GetSharedSignalPool() { return &SharedSignalPool[rand() & 15]; }
 
   InterruptSignal::EventPool* GetEventPool() { return &EventPool; }
 
@@ -751,7 +751,7 @@ class Runtime {
   Flag flag_;
 
   // Pools memory for SharedSignal (Signal ABI blocks)
-  SharedSignalPool_t SharedSignalPool;
+  SharedSignalPool_t SharedSignalPool[16];
 
   // Pools KFD Events for InterruptSignal
   InterruptSignal::EventPool EventPool;
