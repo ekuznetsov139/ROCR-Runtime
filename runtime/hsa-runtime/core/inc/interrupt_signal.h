@@ -86,6 +86,7 @@ class InterruptSignal : private LocalSignal, public Signal {
     HybridMutex lock_;
     std::vector<unique_event_ptr> events_;
     bool allEventsAllocated;
+    int allocated_count=0, freed_count=0, reused_count=0, failed_count=0;
   };
 
   static HsaEvent* CreateEvent(HSA_EVENTTYPE type, bool manual_reset);

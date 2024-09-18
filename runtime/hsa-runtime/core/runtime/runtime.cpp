@@ -1589,19 +1589,23 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
     // Reset the control signal
     if (index == 0) {
       hsa_signal_handle(async_events_control_.wake)->StoreRelaxed(0);
-    } else if (index != -1) {
-      // No error or timout occured, process the handlers
-      // Call handler for the known satisfied signal.
-      assert(async_events_.handler_[index] != NULL);
-      bool keep = async_events_.handler_[index](value, async_events_.arg_[index]);
-      if (!keep) {
-        hsa_signal_handle(async_events_.signal_[index])->Release();
-        async_events_.CopyIndex(index, async_events_.Size() - 1);
-        async_events_.PopBack();
-      }
+    }
+
+    if (index != -1) {
       // Check remaining signals before sleeping.
-      for (size_t i = index; i < async_events_.Size(); i++) {
+
+      // Index 0 always keeps the wake event, which should not be destroyed or moved
+      for (size_t i = 1; i < async_events_.Size(); i++) {
         hsa_signal_handle sig(async_events_.signal_[i]);
+        if (!sig->IsValid() || async_events_.handler_[i]==0) {
+          sig->Release();
+          if (i != async_events_.Size() - 1) {
+            async_events_.CopyIndex(i, async_events_.Size() - 1);
+            i--;
+          }
+          async_events_.PopBack();
+          continue;
+        }
 
         value = atomic::Load(&sig->signal_.value, std::memory_order_relaxed);
         bool condition_met = false;
@@ -1627,27 +1631,22 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
 
         if (condition_met) {
           assert(async_events_.handler_[i] != NULL);
-          bool keep = async_events_.handler_[i](value, async_events_.arg_[i]);
-          if (!keep) {
-            hsa_signal_handle(async_events_.signal_[i])->Release();
-            async_events_.CopyIndex(i, async_events_.Size() - 1);
-            async_events_.PopBack();
-            i--;
+          if (async_events_.handler_[i] != 0) {
+            bool keep = async_events_.handler_[i](value, async_events_.arg_[i]);
+            if (keep)
+              continue;
           }
+        } else {
+          continue;
         }
-      }
-    }
-
-    // Check for dead signals
-    index = 0;
-    while (index != async_events_.Size()) {
-      if (!hsa_signal_handle(async_events_.signal_[index])->IsValid()) {
-        hsa_signal_handle(async_events_.signal_[index])->Release();
-        async_events_.CopyIndex(index, async_events_.Size() - 1);
+        
+        sig->Release();
+        if (i != async_events_.Size() - 1) {
+          async_events_.CopyIndex(i, async_events_.Size() - 1);
+          i--;
+        }
         async_events_.PopBack();
-        continue;
       }
-      index++;
     }
 
     // Insert new signals and find plain functions

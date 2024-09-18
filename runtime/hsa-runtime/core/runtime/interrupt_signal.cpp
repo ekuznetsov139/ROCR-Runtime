@@ -55,15 +55,25 @@ namespace core {
 
 HsaEvent* InterruptSignal::EventPool::alloc() {
   ScopedAcquire<HybridMutex> lock(&lock_);
+  if (!((allocated_count+failed_count+reused_count)%1000000)) {
+    fprintf(stderr, "Event pool allocated %d failed %d reused %d freed %d\n",
+      allocated_count, failed_count, reused_count, freed_count);
+  }
   if (events_.empty()) {
     if (!allEventsAllocated) {
       HsaEvent* evt = InterruptSignal::CreateEvent(HSA_EVENTTYPE_SIGNAL, false);
       if (evt == nullptr) allEventsAllocated = true;
+      if (evt != nullptr)
+        allocated_count++;
+      else
+        failed_count++;
       return evt;
     }
+    failed_count++;
     return nullptr;
   }
   HsaEvent* ret = events_.back().release();
+  reused_count++;
   events_.pop_back();
   return ret;
 }
@@ -72,6 +82,7 @@ void InterruptSignal::EventPool::free(HsaEvent* evt) {
   if (evt == nullptr) return;
   ScopedAcquire<HybridMutex> lock(&lock_);
   events_.push_back(unique_event_ptr(evt));
+  freed_count++;
 }
 
 int InterruptSignal::rtti_id_ = 0;
