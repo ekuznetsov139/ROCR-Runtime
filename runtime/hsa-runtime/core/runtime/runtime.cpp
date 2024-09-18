@@ -827,8 +827,9 @@ hsa_status_t Runtime::SetAsyncSignalHandler(hsa_signal_t signal,
                                             hsa_signal_value_t value,
                                             hsa_amd_signal_handler handler,
                                             void* arg) {
+  int channel = rand() & 3;
 
-  struct AsyncEventsInfo* asyncInfo = &asyncSignals_;
+  struct AsyncEventsInfo* asyncInfo = &asyncSignals_[channel];
 
   if (signal.handle != 0) {
     // Indicate that this signal is in use.
@@ -836,8 +837,9 @@ hsa_status_t Runtime::SetAsyncSignalHandler(hsa_signal_t signal,
 
     core::Signal* coreSignal = core::Signal::Convert(signal);
     if (coreSignal->EopEvent() && coreSignal->EopEvent()->EventData.EventType != HSA_EVENTTYPE_SIGNAL)
-      asyncInfo = &asyncExceptions_;
+      asyncInfo = &asyncExceptions_[channel];
   }
+
 
   ScopedAcquire<HybridMutex> scope_lock(&asyncInfo->control.lock);
 
@@ -1950,8 +1952,10 @@ Runtime::Runtime()
       ref_count_(0),
       kfd_version{} {
 
-  asyncSignals_.monitor_exceptions = false;
-  asyncExceptions_.monitor_exceptions = true;
+  for (int i=0; i<8; i++) {
+    asyncSignals_[i].monitor_exceptions = false;
+    asyncExceptions_[i].monitor_exceptions = true;
+  }
 }
 
 hsa_status_t Runtime::Load() {
@@ -2032,8 +2036,10 @@ void Runtime::Unload() {
   std::for_each(disabled_gpu_agents_.begin(), disabled_gpu_agents_.end(), DeleteObject());
   disabled_gpu_agents_.clear();
 
-  asyncSignals_.control.Shutdown();
-  asyncExceptions_.control.Shutdown();
+  for (int i=0; i<8; i++) {
+    asyncSignals_[i].control.Shutdown(); 
+    asyncExceptions_[i].control.Shutdown();
+  }
 
   if (vm_fault_signal_ != nullptr) {
     vm_fault_signal_->DestroySignal();

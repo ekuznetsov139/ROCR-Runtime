@@ -711,8 +711,8 @@ class Runtime {
     bool monitor_exceptions;
   };
 
-  struct AsyncEventsInfo asyncSignals_;
-  struct AsyncEventsInfo asyncExceptions_;
+  struct AsyncEventsInfo asyncSignals_[8];
+  struct AsyncEventsInfo asyncExceptions_[8];
 
   // System clock frequency.
   uint64_t sys_clock_freq_;
