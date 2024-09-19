@@ -961,7 +961,7 @@ hsa_status_t Runtime::PtrInfo(const void* ptr, hsa_amd_pointer_info_t* info, voi
 
   {  // memory_lock protects access to the NMappedNodes array and fragment user data since these may
      // change with calls to memory APIs.
-    ScopedAcquire<KernelSharedMutex> lock(&memory_lock_);
+    ScopedAcquire<KernelSharedMutex,false> lock(&memory_lock_);
 
     // We don't care if this returns an error code.
     // The type will be HSA_EXT_POINTER_TYPE_UNKNOWN if so.

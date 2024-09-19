@@ -231,7 +231,7 @@ template <> class isMutex<KernelSharedMutex> {
 /// @brief: A class behaves as a lock in a scope. When trying to enter into the
 /// critical section, creat a object of this class. After the control path goes
 /// out of the scope, it will release the lock automatically.
-template <class LockType> class ScopedAcquire {
+template <class LockType, bool unique = true> class ScopedAcquire {
  public:
   /// @brief: When constructing, acquire the lock.
   /// @param: lock(Input), pointer to an existing lock.
@@ -257,7 +257,7 @@ template <class LockType> class ScopedAcquire {
 
  private:
   /// @brief: Adapts between pointers to mutex types and mutex pointer types.
-  template <class T, bool B> class container {
+  template <class T, bool U, bool B> class container {
    public:
     container(T* lock) : lock_(lock) {}
     __forceinline bool Acquire() { return lock_->Acquire(); }
@@ -268,7 +268,7 @@ template <class LockType> class ScopedAcquire {
   };
 
   /// @brief: Specialization for mutex pointer types.
-  template <class T> class container<T, false> {
+  template <class T, bool U> class container<T, U, false> {
    public:
     container(T lock) : lock_(lock) {}
     __forceinline bool Acquire() { return lock_.Acquire(); }
@@ -278,7 +278,28 @@ template <class LockType> class ScopedAcquire {
     T lock_;
   };
 
-  container<LockType, isMutex<LockType>::value> lock_;
+  template <class T> class container<T, false, false> {
+   public:
+    container(T lock) : lock_(lock) {}
+    __forceinline bool Acquire() { return lock_.AcquireShared(); }
+    __forceinline void Release() { return lock_.ReleaseShared(); }
+
+   private:
+    T lock_;
+  };
+
+  template <class T> class container<T, false, true>  {
+   public:
+    container(T* lock) : lock_(lock) {}
+    __forceinline bool Acquire() { return lock_->AcquireShared(); }
+    __forceinline void Release() { return lock_->ReleaseShared(); }
+
+   private:
+    T* lock_;
+  };
+
+
+  container<LockType, unique, isMutex<LockType>::value> lock_;
   bool doRelease;
 
   /// @brief: Disable copiable and assignable ability.
