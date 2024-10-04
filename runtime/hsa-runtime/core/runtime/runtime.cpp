@@ -851,8 +851,8 @@ hsa_status_t Runtime::SetAsyncSignalHandler(hsa_signal_t signal,
       assert(false && "Asyncronous events control signal creation error.");
       return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
-    asyncInfo->events.PushBack(asyncInfo->control.wake, HSA_SIGNAL_CONDITION_NE,
-                          0, NULL, NULL);
+    asyncInfo->events.PushBack(AsyncEvent{asyncInfo->control.wake, HSA_SIGNAL_CONDITION_NE,
+                          0, NULL, NULL});
 
     // Start event monitoring thread
     asyncInfo->control.exit = false;
@@ -864,7 +864,7 @@ hsa_status_t Runtime::SetAsyncSignalHandler(hsa_signal_t signal,
     }
   }
 
-  asyncInfo->new_events.PushBack(signal, cond, value, handler, arg);
+  asyncInfo->new_events.PushBack(AsyncEvent{signal, cond, value, handler, arg});
 
   hsa_signal_handle(asyncInfo->control.wake)->StoreRelease(1);
 
@@ -1565,6 +1565,9 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
   auto& async_events_ = eventsInfo->events;
   auto& new_async_events_ = eventsInfo->new_events;
 
+  HsaEvent** temp = 0;
+  int temp_size = 0;
+
   while (!async_events_control_.exit) {
     // Wait for a signal
     hsa_signal_value_t value;
@@ -1573,19 +1576,15 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
     if (eventsInfo->monitor_exceptions) {
       index = Signal::WaitAnyExceptions(
                           uint32_t(async_events_.Size()),
-                          &async_events_.signal_[0],
-                          &async_events_.cond_[0],
-                          &async_events_.value_[0],
-                          &value);
+                          &async_events_.v[0],
+                          &value, temp, temp_size);
     } else {
-      index = AMD::hsa_amd_signal_wait_any(
+      index = Signal::WaitAny(
                           uint32_t(async_events_.Size()),
-                          &async_events_.signal_[0],
-                          &async_events_.cond_[0],
-                          &async_events_.value_[0],
+                          &async_events_.v[0],
                           uint64_t(-1),
                           HSA_WAIT_STATE_BLOCKED,
-                          &value);
+                          &value, temp, temp_size);
     }
 
     // Reset the control signal
@@ -1598,8 +1597,8 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
 
       // Index 0 always keeps the wake event, which should not be destroyed or moved
       for (size_t i = 1; i < async_events_.Size(); i++) {
-        hsa_signal_handle sig(async_events_.signal_[i]);
-        if (!sig->IsValid() || async_events_.handler_[i]==0) {
+        hsa_signal_handle sig(async_events_.v[i].signal);
+        if (!sig->IsValid() || async_events_.v[i].handler==0) {
           sig->Release();
           if (i != async_events_.Size() - 1) {
             async_events_.CopyIndex(i, async_events_.Size() - 1);
@@ -1612,29 +1611,29 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
         value = atomic::Load(&sig->signal_.value, std::memory_order_relaxed);
         bool condition_met = false;
 
-        switch (async_events_.cond_[i]) {
+        switch (async_events_.v[i].cond) {
           case HSA_SIGNAL_CONDITION_EQ: {
-            condition_met = (value == async_events_.value_[i]);
+            condition_met = (value == async_events_.v[i].value);
             break;
           }
           case HSA_SIGNAL_CONDITION_NE: {
-            condition_met = (value != async_events_.value_[i]);
+            condition_met = (value != async_events_.v[i].value);
             break;
           }
           case HSA_SIGNAL_CONDITION_GTE: {
-            condition_met = (value >= async_events_.value_[i]);
+            condition_met = (value >= async_events_.v[i].value);
             break;
           }
           case HSA_SIGNAL_CONDITION_LT: {
-            condition_met = (value < async_events_.value_[i]);
+            condition_met = (value < async_events_.v[i].value);
             break;
           }
         }
 
         if (condition_met) {
-          assert(async_events_.handler_[i] != NULL);
-          if (async_events_.handler_[i] != 0) {
-            bool keep = async_events_.handler_[i](value, async_events_.arg_[i]);
+          assert(async_events_.v[i].handler != NULL);
+          if (async_events_.v[i].handler != 0) {
+            bool keep = async_events_.v[i].handler(value, async_events_.v[i].arg);
             if (keep)
               continue;
           }
@@ -1657,16 +1656,13 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
     {
       ScopedAcquire<HybridMutex> scope_lock(&async_events_control_.lock);
       for (size_t i = 0; i < new_async_events_.Size(); i++) {
-        if (new_async_events_.signal_[i].handle == 0) {
+        if (new_async_events_.v[i].signal.handle == 0) {
           functions.push_back(
-              func_arg_t((void (*)(void*))new_async_events_.handler_[i],
-                         new_async_events_.arg_[i]));
+              func_arg_t((void (*)(void*))new_async_events_.v[i].handler,
+                         new_async_events_.v[i].arg));
           continue;
         }
-        async_events_.PushBack(
-            new_async_events_.signal_[i], new_async_events_.cond_[i],
-            new_async_events_.value_[i], new_async_events_.handler_[i],
-            new_async_events_.arg_[i]);
+        async_events_.PushBack(new_async_events_.v[i]);
       }
       new_async_events_.Clear();
     }
@@ -1679,12 +1675,14 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
 
   // Release wait count of all pending signals
   for (size_t i = 1; i < async_events_.Size(); i++)
-    hsa_signal_handle(async_events_.signal_[i])->Release();
+    hsa_signal_handle(async_events_.v[i].signal)->Release();
   async_events_.Clear();
 
   for (size_t i = 0; i < new_async_events_.Size(); i++)
-    hsa_signal_handle(new_async_events_.signal_[i])->Release();
+    hsa_signal_handle(new_async_events_.v[i].signal)->Release();
   new_async_events_.Clear();
+
+  delete[] temp;
 }
 
 void Runtime::BindErrorHandlers() {
@@ -2413,41 +2411,22 @@ void Runtime::AsyncEventsControl::Shutdown() {
   }
 }
 
-void Runtime::AsyncEvents::PushBack(hsa_signal_t signal,
-                                    hsa_signal_condition_t cond,
-                                    hsa_signal_value_t value,
-                                    hsa_amd_signal_handler handler, void* arg) {
-  signal_.push_back(signal);
-  cond_.push_back(cond);
-  value_.push_back(value);
-  handler_.push_back(handler);
-  arg_.push_back(arg);
+void Runtime::AsyncEvents::PushBack(const AsyncEvent& event) {
+  v.push_back(event);
 }
 
 void Runtime::AsyncEvents::CopyIndex(size_t dst, size_t src) {
-  signal_[dst] = signal_[src];
-  cond_[dst] = cond_[src];
-  value_[dst] = value_[src];
-  handler_[dst] = handler_[src];
-  arg_[dst] = arg_[src];
+  v[dst] = v[src];
 }
 
-size_t Runtime::AsyncEvents::Size() { return signal_.size(); }
+size_t Runtime::AsyncEvents::Size() { return v.size(); }
 
 void Runtime::AsyncEvents::PopBack() {
-  signal_.pop_back();
-  cond_.pop_back();
-  value_.pop_back();
-  handler_.pop_back();
-  arg_.pop_back();
+  v.pop_back();
 }
 
 void Runtime::AsyncEvents::Clear() {
-  signal_.clear();
-  cond_.clear();
-  value_.clear();
-  handler_.clear();
-  arg_.clear();
+  v.clear();
 }
 
 hsa_status_t Runtime::SetCustomSystemEventHandler(hsa_amd_system_event_callback_t callback,

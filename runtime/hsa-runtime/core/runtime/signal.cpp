@@ -415,6 +415,257 @@ uint32_t Signal::WaitAnyExceptions(uint32_t signal_count, const hsa_signal_t* hs
   } //while
 }
 
+
+uint32_t Signal::WaitAny(uint32_t signal_count, const AsyncEvent* async_events,
+                         uint64_t timeout, hsa_wait_state_t wait_hint,
+                         hsa_signal_value_t* satisfying_value, HsaEvent**& temp, int& temp_size) {
+  //hsa_signal_handle* signals =
+  //    reinterpret_cast<hsa_signal_handle*>(const_cast<hsa_signal_t*>(hsa_signals));
+
+  for (uint32_t i = 0; i < signal_count; i++) async_events[i].as_hsa_signal_handle()->Retain();
+
+  MAKE_SCOPE_GUARD([&]() {
+    for (uint32_t i = 0; i < signal_count; i++) async_events[i].as_hsa_signal_handle()->Release();
+  });
+
+  uint32_t prior = 0;
+  for (uint32_t i = 0; i < signal_count; i++) prior = Max(prior, async_events[i].as_hsa_signal_handle()->waiting_++);
+
+  MAKE_SCOPE_GUARD([&]() {
+    for (uint32_t i = 0; i < signal_count; i++) async_events[i].as_hsa_signal_handle()->waiting_--;
+  });
+
+  if (!core::Runtime::runtime_singleton_->KfdVersion().supports_event_age)
+      // Allow only the first waiter to sleep. Without event age tracking,
+      // race condition can cause some threads to sleep without wakeup since missing interrupt.
+      if (prior != 0) wait_hint = HSA_WAIT_STATE_ACTIVE;
+
+  // Ensure that all signals in the list can be slept on.
+  if (wait_hint != HSA_WAIT_STATE_ACTIVE) {
+    for (uint32_t i = 0; i < signal_count; i++) {
+      if (async_events[i].as_hsa_signal_handle()->EopEvent() == NULL) {
+        wait_hint = HSA_WAIT_STATE_ACTIVE;
+        break;
+      }
+    }
+  }
+
+  const uint32_t small_size = 10;
+  HsaEvent* short_evts[small_size];
+  HsaEvent** evts = NULL;
+  uint32_t unique_evts = 0;
+  if (wait_hint != HSA_WAIT_STATE_ACTIVE) {
+    if (signal_count > small_size) {
+      //evts = new HsaEvent* [signal_count];
+      if (temp_size < signal_count) {
+        if (temp != NULL) delete[] temp;
+        temp = new HsaEvent* [signal_count];
+        temp_size = signal_count;
+      }
+      evts = temp;
+    }
+    else
+      evts = short_evts;
+    for (uint32_t i = 0; i < signal_count; i++)
+      evts[i] = async_events[i].as_hsa_signal_handle()->EopEvent();
+    std::sort(evts, evts + signal_count);
+    HsaEvent** end = std::unique(evts, evts + signal_count);
+    unique_evts = uint32_t(end - evts);
+  }
+  //MAKE_SCOPE_GUARD([&]() {
+  //  if (signal_count > small_size) delete[] evts;
+  //});
+
+  uint64_t event_age[unique_evts];
+  memset(event_age, 0, unique_evts * sizeof(uint64_t));
+  if (core::Runtime::runtime_singleton_->KfdVersion().supports_event_age)
+    for (uint32_t i = 0; i < unique_evts; i++)
+      event_age[i] = 1;
+
+  int64_t value;
+
+  timer::fast_clock::time_point start_time = timer::fast_clock::now();
+
+  // Set a polling timeout value
+  const timer::fast_clock::duration kMaxElapsed = std::chrono::microseconds(200);
+
+  // Convert timeout value into the fast_clock domain
+  uint64_t hsa_freq;
+  HSA::hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &hsa_freq);
+  const timer::fast_clock::duration fast_timeout =
+      timer::duration_from_seconds<timer::fast_clock::duration>(
+          double(timeout) / double(hsa_freq));
+
+  bool condition_met = false;
+  while (true) {
+    // Cannot mwaitx - polling multiple signals
+    for (uint32_t i = 0; i < signal_count; i++) {
+      if (!async_events[i].as_hsa_signal_handle()->IsValid())
+        return uint32_t(-1);
+
+      value =
+          atomic::Load(&async_events[i].as_hsa_signal_handle()->signal_.value, std::memory_order_relaxed);
+
+      switch (async_events[i].cond) {
+        case HSA_SIGNAL_CONDITION_EQ: {
+          condition_met = (value == async_events[i].value);
+          break;
+        }
+        case HSA_SIGNAL_CONDITION_NE: {
+          condition_met = (value != async_events[i].value);
+          break;
+        }
+        case HSA_SIGNAL_CONDITION_GTE: {
+          condition_met = (value >= async_events[i].value);
+          break;
+        }
+        case HSA_SIGNAL_CONDITION_LT: {
+          condition_met = (value < async_events[i].value);
+          break;
+        }
+        default:
+          return uint32_t(-1);
+      }
+      if (condition_met) {
+        if (satisfying_value != NULL) *satisfying_value = value;
+        return i;
+      }
+    }
+
+    timer::fast_clock::time_point time = timer::fast_clock::now();
+    if (time - start_time > fast_timeout) {
+      return uint32_t(-1);
+    }
+
+    if (wait_hint == HSA_WAIT_STATE_ACTIVE) {
+      continue;
+    }
+
+    if (time - start_time < kMaxElapsed) {
+    //  os::uSleep(20);
+      continue;
+    }
+
+    uint32_t wait_ms;
+    auto time_remaining = fast_timeout - (time - start_time);
+    uint64_t ct=timer::duration_cast<std::chrono::milliseconds>(
+      time_remaining).count();
+    wait_ms = (ct>0xFFFFFFFEu) ? 0xFFFFFFFEu : ct;
+    hsaKmtWaitOnMultipleEvents_Ext(evts, unique_evts, false, wait_ms, event_age);
+  }
+}
+
+/*
+ * Special handler to wait listen for exceptions from underlying driver.
+ */
+uint32_t Signal::WaitAnyExceptions(uint32_t signal_count, const AsyncEvent* async_events,
+                         hsa_signal_value_t* satisfying_value, HsaEvent**& temp, int& temp_size) {
+
+  //const hsa_signal_t* hsa_signals,const hsa_signal_condition_t* conds, const hsa_signal_value_t* values,
+  uint32_t wait_ms = uint32_t(-1);
+  //hsa_signal_handle* signals =
+  //    reinterpret_cast<hsa_signal_handle*>(const_cast<hsa_signal_t*>(hsa_signals));
+
+  for (uint32_t i = 0; i < signal_count; i++) async_events[i].as_hsa_signal_handle()->Retain();
+
+  MAKE_SCOPE_GUARD([&]() {
+    for (uint32_t i = 0; i < signal_count; i++) async_events[i].as_hsa_signal_handle()->Release();
+  });
+
+  uint32_t prior = 0;
+  for (uint32_t i = 0; i < signal_count; i++) prior = Max(prior, async_events[i].as_hsa_signal_handle()->waiting_++);
+
+
+  MAKE_SCOPE_GUARD([&]() {
+    for (uint32_t i = 0; i < signal_count; i++) async_events[i].as_hsa_signal_handle()->waiting_--;
+  });
+
+  if (!core::Runtime::runtime_singleton_->KfdVersion().supports_event_age)
+      // Allow only the first waiter to sleep. Without event age tracking,
+      // race condition can cause some threads to sleep without wakeup since missing interrupt.
+      if (prior != 0) wait_ms = 0;
+
+  if (temp_size < signal_count) {
+    if (temp != NULL) delete[] temp;
+    temp = new HsaEvent* [signal_count];
+    temp_size = signal_count;
+  }
+  HsaEvent** evts = temp;
+
+  //MAKE_SCOPE_GUARD([&]() { delete[] evts; });
+
+  uint32_t unique_evts = 0;
+
+  for (uint32_t i = 0; i < signal_count; i++) {
+    assert(async_events[i].as_hsa_signal_handle()->EopEvent() != NULL);
+    evts[i] = async_events[i].as_hsa_signal_handle()->EopEvent();
+  }
+
+  std::sort(evts, evts + signal_count);
+  HsaEvent** end = std::unique(evts, evts + signal_count);
+  unique_evts = uint32_t(end - evts);
+
+  uint64_t event_age[unique_evts];
+  memset(event_age, 0, unique_evts * sizeof(uint64_t));
+  if (core::Runtime::runtime_singleton_->KfdVersion().supports_event_age)
+    for (uint32_t i = 0; i < unique_evts; i++)
+      event_age[i] = 1;
+
+  int64_t value;
+
+  bool condition_met = false;
+  while (true) {
+    // Cannot mwaitx - polling multiple signals
+
+    for (uint32_t i = 0; i < signal_count; i++) {
+      if (!async_events[i].as_hsa_signal_handle()->IsValid())
+        return uint32_t(-1);
+
+      const HSA_EVENTTYPE event_type = async_events[i].as_hsa_signal_handle()->EopEvent()->EventData.EventType;
+      if (event_type == HSA_EVENTTYPE_MEMORY) {
+        const HsaMemoryAccessFault& fault =
+            async_events[i].as_hsa_signal_handle()->EopEvent()->EventData.EventData.MemoryAccessFault;
+        if (fault.Flags == HSA_EVENTID_MEMORY_FATAL_PROCESS) return i;
+      } else if (event_type == HSA_EVENTTYPE_HW_EXCEPTION) {
+        const HsaHwException& exception =
+            async_events[i].as_hsa_signal_handle()->EopEvent()->EventData.EventData.HwException;
+        if (exception.MemoryLost) return i;
+      }
+
+      value = atomic::Load(&async_events[i].as_hsa_signal_handle()->signal_.value, std::memory_order_relaxed);
+
+      switch (async_events[i].cond) {
+        case HSA_SIGNAL_CONDITION_EQ: {
+          condition_met = (value == async_events[i].value);
+          break;
+        }
+        case HSA_SIGNAL_CONDITION_NE: {
+          condition_met = (value != async_events[i].value);
+          break;
+        }
+        case HSA_SIGNAL_CONDITION_GTE: {
+          condition_met = (value >= async_events[i].value);
+          break;
+        }
+        case HSA_SIGNAL_CONDITION_LT: {
+          condition_met = (value < async_events[i].value);
+          break;
+        }
+        default: {
+          return uint32_t(-1);
+        }
+      }
+      if (condition_met) {
+        if (satisfying_value != NULL) *satisfying_value = value;
+        // Some other signal in the list satisfied condition
+        return i;
+      }
+    }
+
+    hsaKmtWaitOnMultipleEvents_Ext(evts, unique_evts, false, wait_ms, event_age);
+  } //while
+}
+
 SignalGroup::SignalGroup(uint32_t num_signals, const hsa_signal_t* hsa_signals)
     : count(num_signals) {
   if (count != 0) {

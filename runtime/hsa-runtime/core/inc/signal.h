@@ -77,6 +77,20 @@ template <> struct less<hsa_signal_t> {
 
 namespace rocr {
 namespace core {
+
+struct hsa_signal_handle;
+
+struct AsyncEvent {
+  hsa_signal_t signal;
+  hsa_signal_condition_t cond;
+  hsa_signal_value_t value;
+  bool (*handler)(hsa_signal_value_t value, void* arg);
+  void* arg;
+
+  hsa_signal_handle& as_hsa_signal_handle() const { return *(reinterpret_cast<hsa_signal_handle*>(const_cast<hsa_signal_t*>(&signal))); };
+};
+
+
 class Agent;
 class Signal;
 
@@ -369,6 +383,12 @@ class Signal {
   static uint32_t WaitAnyExceptions(uint32_t signal_count, const hsa_signal_t* hsa_signals,
                          const hsa_signal_condition_t* conds, const hsa_signal_value_t* values,
                          hsa_signal_value_t* satisfying_value);
+
+  static uint32_t WaitAny(uint32_t signal_count, const AsyncEvent* signals,
+                          uint64_t timeout_hint, hsa_wait_state_t wait_hint,
+                          hsa_signal_value_t* satisfying_value, HsaEvent**& temp, int& temp_size);
+  static uint32_t WaitAnyExceptions(uint32_t signal_count, const AsyncEvent* signals,
+                         hsa_signal_value_t* satisfying_value, HsaEvent**& temp, int& temp_size);
 
   __forceinline bool IsType(rtti_t id) { return _IsA(id); }
 

@@ -540,9 +540,7 @@ class Runtime {
   };
 
   struct AsyncEvents {
-    void PushBack(hsa_signal_t signal, hsa_signal_condition_t cond,
-                  hsa_signal_value_t value, hsa_amd_signal_handler handler,
-                  void* arg);
+    void PushBack(const AsyncEvent& event);
 
     void CopyIndex(size_t dst, size_t src);
 
@@ -552,11 +550,7 @@ class Runtime {
 
     void Clear();
 
-    std::vector<hsa_signal_t> signal_;
-    std::vector<hsa_signal_condition_t> cond_;
-    std::vector<hsa_signal_value_t> value_;
-    std::vector<hsa_amd_signal_handler> handler_;
-    std::vector<void*> arg_;
+    std::vector<AsyncEvent> v;
   };
 
   struct PrefetchRange;
