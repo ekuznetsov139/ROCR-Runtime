@@ -174,6 +174,7 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(
 
   int64_t value;
 
+  uint64_t raw_start_time = timer::fast_clock::raw_now();
   timer::fast_clock::time_point start_time = timer::fast_clock::now();
 
   // Set a polling timeout value
@@ -182,9 +183,13 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(
 
   uint64_t hsa_freq;
   HSA::hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &hsa_freq);
+  double timeout_sec = double(timeout) / double(hsa_freq);
   const timer::fast_clock::duration fast_timeout =
-      timer::duration_from_seconds<timer::fast_clock::duration>(
-          double(timeout) / double(hsa_freq));
+      timer::duration_from_seconds<timer::fast_clock::duration>(timeout_sec);
+
+  double f_raw_fast_timeout = timeout_sec * timer::fast_clock::raw_freq();
+  uint64_t raw_fast_timeout = (f_raw_fast_timeout > 1e19) ? -1 : uint64_t(f_raw_fast_timeout);
+  uint64_t raw_kMaxElapsed = 200e-6 * timer::fast_clock::raw_freq();
 
   bool condition_met = false;
 
@@ -219,8 +224,8 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(
     }
     if (condition_met) return hsa_signal_value_t(value);
 
-    timer::fast_clock::time_point time = timer::fast_clock::now();
-    if (time - start_time > fast_timeout) {
+    uint64_t raw_time = timer::fast_clock::raw_now();
+    if (raw_time - raw_start_time > raw_fast_timeout) {
       value = atomic::Load(&signal_.value, std::memory_order_relaxed);
       return hsa_signal_value_t(value);
     }
@@ -235,7 +240,7 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(
       continue;
     }
 
-    if (time - start_time < kMaxElapsed) {
+    if (raw_time - raw_start_time < raw_kMaxElapsed) {
       //  os::uSleep(20);
 #if defined(__i386__) || defined(__x86_64__)
       if (g_use_mwaitx) {
@@ -247,11 +252,14 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(
     }
 
     uint32_t wait_ms;
-    auto time_remaining = fast_timeout - (time - start_time);
-    uint64_t ct=timer::duration_cast<std::chrono::milliseconds>(
-      time_remaining).count();
-    wait_ms = (ct>0xFFFFFFFEu) ? 0xFFFFFFFEu : ct;
-    hsaKmtWaitOnEvent_Ext(event_, wait_ms, &event_age);
+    timer::fast_clock::time_point time = timer::fast_clock::now();
+    if (time - start_time < fast_timeout) {
+      auto time_remaining = fast_timeout - (time - start_time);
+      uint64_t ct=timer::duration_cast<std::chrono::milliseconds>(
+        time_remaining).count();
+      wait_ms = (ct>0xFFFFFFFEu) ? 0xFFFFFFFEu : ct;
+      hsaKmtWaitOnEvent_Ext(event_, wait_ms, &event_age);
+    }
   }
 }
 
