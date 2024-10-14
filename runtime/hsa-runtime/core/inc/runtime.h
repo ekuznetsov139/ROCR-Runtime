@@ -703,6 +703,7 @@ class Runtime {
     AsyncEvents events;
     AsyncEvents new_events;
     bool monitor_exceptions;
+    int id;
   };
 
   struct AsyncEventsInfo asyncSignals_[8];

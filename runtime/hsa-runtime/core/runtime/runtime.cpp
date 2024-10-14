@@ -74,6 +74,7 @@
 #include "core/inc/hsa_ext_amd_impl.h"
 #include "core/inc/hsa_api_trace_int.h"
 #include "core/util/os.h"
+#include "core/util/timer.h"
 #include "core/inc/exceptions.h"
 #include "inc/hsa_ven_amd_aqlprofile.h"
 #include "core/inc/amd_core_dump.hpp"
@@ -851,6 +852,7 @@ hsa_status_t Runtime::SetAsyncSignalHandler(hsa_signal_t signal,
       assert(false && "Asyncronous events control signal creation error.");
       return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
+    asyncInfo->id = channel;
     asyncInfo->events.PushBack(AsyncEvent{asyncInfo->control.wake, HSA_SIGNAL_CONDITION_NE,
                           0, NULL, NULL});
 
@@ -1568,10 +1570,20 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
   HsaEvent** temp = 0;
   int temp_size = 0;
 
+  timer::fast_clock::time_point start_time = timer::fast_clock::now();
+
+  uint64_t hsa_freq;
+  HSA::hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &hsa_freq);
+  uint64_t timeout_value = 10 * hsa_freq;
+/*  
+  const timer::fast_clock::duration fast_timeout =
+      timer::duration_from_seconds<timer::fast_clock::duration>(
+          double(timeout) / double(hsa_freq));
+*/
   while (!async_events_control_.exit) {
     // Wait for a signal
     hsa_signal_value_t value;
-    uint32_t index = 0;
+    int32_t index = 0;
 
     if (eventsInfo->monitor_exceptions) {
       index = Signal::WaitAnyExceptions(
@@ -1586,6 +1598,31 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
                           HSA_WAIT_STATE_BLOCKED,
                           &value, temp, temp_size);
     }
+    bool warning = false;
+    if (index < 0 && async_events_.Size() > 1) {
+      timer::fast_clock::time_point t = timer::fast_clock::now();
+      uint64_t elapsed = timer::duration_cast<std::chrono::seconds>(t - start_time).count();
+      //if (elapsed > 100) 
+      {
+        printf("WARNING: Runtime::AsyncEventsLoop %d has been waiting for %d s on %d events\n", eventsInfo->id, elapsed, async_events_.Size());
+        for (int i=0; i<async_events_.Size(); i++) {
+          printf("  %d: %p, cond %d, value %d, handler %p, arg %p\n", i, async_events_.v[i].signal, 
+                  async_events_.v[i].cond, async_events_.v[i].value, async_events_.v[i].handler, async_events_.v[i].arg);
+        }
+        fflush(stdout);
+      }
+      warning = true;
+    }
+
+    if (index >= 0) {
+      start_time = timer::fast_clock::now();
+    }
+
+
+    if (warning) {
+      // check all the events just in case
+      index = 1;
+    }
 
     // Reset the control signal
     if (index == 0) {
@@ -1599,6 +1636,9 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
       for (size_t i = 1; i < async_events_.Size(); i++) {
         hsa_signal_handle sig(async_events_.v[i].signal);
         if (!sig->IsValid() || async_events_.v[i].handler==0) {
+          if (warning) 
+            printf("Signal %d %p: valid %d, handler %p; releasing\n", i, async_events_.v[i].signal, sig->IsValid(), async_events_.v[i].handler);
+
           sig->Release();
           if (i != async_events_.Size() - 1) {
             async_events_.CopyIndex(i, async_events_.Size() - 1);
@@ -1631,6 +1671,8 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
         }
 
         if (condition_met) {
+          if (warning)
+            printf("Signal %d %p: condition met\n", i, async_events_.v[i].signal);
           assert(async_events_.v[i].handler != NULL);
           if (async_events_.v[i].handler != 0) {
             bool keep = async_events_.v[i].handler(value, async_events_.v[i].arg);
@@ -1655,6 +1697,9 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
     std::vector<func_arg_t> functions;
     {
       ScopedAcquire<HybridMutex> scope_lock(&async_events_control_.lock);
+      if (warning) {
+        printf("Inserting %d new signals into the backlog\n", new_async_events_.Size());
+      }
       for (size_t i = 0; i < new_async_events_.Size(); i++) {
         if (new_async_events_.v[i].signal.handle == 0) {
           functions.push_back(
@@ -1671,6 +1716,8 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
     for (size_t i = 0; i < functions.size(); i++)
       functions[i].first(functions[i].second);
     functions.clear();
+    if (warning)
+      fflush(stdout);
   }
 
   // Release wait count of all pending signals
